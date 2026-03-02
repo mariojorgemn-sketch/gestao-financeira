@@ -12,7 +12,7 @@ import base64
 import json
 import re
 import io
-import requests
+import pdfplumber
 
 # ══════════════════════════════════════════════════════════════
 # CONFIGURAÇÃO DA PÁGINA
@@ -170,67 +170,164 @@ def exportar_excel(ini=None, fim=None):
     return buf
 
 # ══════════════════════════════════════════════════════════════
-# CLAUDE API — EXTRAÇÃO DE PDF
+# EXTRAÇÃO LOCAL DE PDF — pdfplumber (gratuito, sem API)
 # ══════════════════════════════════════════════════════════════
 
-SYSTEM_PROMPT_PDF = """
-És um assistente especializado em extração de dados financeiros de faturas em PDF.
-Devolve APENAS um objeto JSON válido, sem texto adicional, sem markdown.
+def extrair_texto_pdf(pdf_bytes):
+    """Extrai todo o texto de um PDF usando pdfplumber."""
+    texto = ""
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for pagina in pdf.pages:
+            texto += (pagina.extract_text() or "") + "\n"
+    return texto
 
-Formato obrigatório:
-{
-  "tipo": "despesa",
-  "registos": [
-    {
-      "data": "YYYY-MM-DD",
-      "descricao": "Descrição curta do item ou serviço",
-      "categoria": "Categoria",
-      "valor": 123.45
+
+def parsear_data(texto):
+    """Tenta encontrar uma data no texto em vários formatos."""
+    padroes = [
+        r"\b(\d{4}-\d{2}-\d{2})\b",           # 2024-03-15
+        r"\b(\d{2}/\d{2}/\d{4})\b",            # 15/03/2024
+        r"\b(\d{2}-\d{2}-\d{4})\b",            # 15-03-2024
+        r"\b(\d{1,2}\s+\w+\s+\d{4})\b",        # 15 março 2024
+    ]
+    formatos = ["%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"]
+    meses_pt = {
+        "janeiro":"01","fevereiro":"02","março":"03","abril":"04",
+        "maio":"05","junho":"06","julho":"07","agosto":"08",
+        "setembro":"09","outubro":"10","novembro":"11","dezembro":"12"
     }
-  ],
-  "fornecedor": "Nome do fornecedor"
-}
+    for padrao in padroes:
+        m = re.search(padrao, texto, re.IGNORECASE)
+        if m:
+            s = m.group(1)
+            for fmt in formatos:
+                try:
+                    return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+                except ValueError:
+                    pass
+            # Tentar formato "15 março 2024"
+            for pt, num in meses_pt.items():
+                if pt in s.lower():
+                    s2 = re.sub(pt, num, s.lower())
+                    try:
+                        return datetime.strptime(s2, "%d %m %Y").strftime("%Y-%m-%d")
+                    except ValueError:
+                        pass
+    return str(date.today())
 
-Categorias disponíveis para despesas: Salários, Aluguel, Marketing, Fornecedores, Utilidades, Impostos, Manutenção, Outros
-Categorias disponíveis para receitas: Vendas, Serviços, Investimentos, Comissões, Outros
-- "tipo" é "despesa" para faturas de fornecedores, "receita" para vendas emitidas pela empresa.
-- "valor" é numérico float sem símbolo de moeda.
-- Se a fatura tiver múltiplos itens, cria um registo por item.
-- Se não encontrares um campo, usa null.
-- Devolve SEMPRE JSON válido.
-"""
 
-def analisar_pdf_com_ia(pdf_bytes, nome_ficheiro, api_key):
-    pdf_b64 = base64.standard_b64encode(pdf_bytes).decode("utf-8")
-    payload = {
-        "model": "claude-sonnet-4-20250514",
-        "max_tokens": 2048,
-        "system": SYSTEM_PROMPT_PDF,
-        "messages": [{
-            "role": "user",
-            "content": [
-                {
-                    "type": "document",
-                    "source": {"type": "base64", "media_type": "application/pdf", "data": pdf_b64}
-                },
-                {
-                    "type": "text",
-                    "text": f"Analisa a fatura '{nome_ficheiro}' e extrai os dados em JSON."
-                }
-            ]
+def parsear_valor(texto):
+    """Extrai o valor total da fatura — procura o maior valor monetário."""
+    # Padrões comuns em faturas portuguesas
+    padroes_total = [
+        r"total\s+(?:a\s+pagar|geral|fatura)[\s:]*([0-9]+[.,][0-9]{2})",
+        r"valor\s+total[\s:]*([0-9]+[.,][0-9]{2})",
+        r"montante\s+total[\s:]*([0-9]+[.,][0-9]{2})",
+        r"total[\s:]+([0-9]+[.,][0-9]{2})\s*€",
+        r"([0-9]+[.,][0-9]{2})\s*€",
+    ]
+    for padrao in padroes_total:
+        m = re.search(padrao, texto, re.IGNORECASE)
+        if m:
+            val = m.group(1).replace(".", "").replace(",", ".")
+            try:
+                return float(val)
+            except ValueError:
+                pass
+    # Fallback: encontrar todos os valores e devolver o maior
+    todos = re.findall(r"\b(\d{1,6}[.,]\d{2})\b", texto)
+    valores = []
+    for v in todos:
+        try:
+            valores.append(float(v.replace(".", "").replace(",", ".")))
+        except ValueError:
+            pass
+    return max(valores) if valores else 0.0
+
+
+def inferir_categoria(texto):
+    """Infere a categoria da despesa com base em palavras-chave."""
+    texto_lower = texto.lower()
+    mapa = {
+        "Salários":     ["salário","salario","vencimento","remuneração","rmh","recibo verde"],
+        "Aluguel":      ["aluguer","aluguel","arrendamento","renda","alugar"],
+        "Marketing":    ["marketing","publicidade","campanha","anúncio","google ads","facebook"],
+        "Fornecedores": ["fornecedor","material","mercadoria","produto","stock","compra"],
+        "Utilidades":   ["electricidade","eletricidade","água","agua","gás","gas","internet",
+                         "telefone","telecomunicações","edp","galp","nos","meo","vodafone"],
+        "Impostos":     ["iva","imposto","taxa","irs","irc","segurança social","ss","at -"],
+        "Manutenção":   ["manutenção","manutencao","reparação","reparacao","serviço técnico"],
+    }
+    for categoria, palavras in mapa.items():
+        for palavra in palavras:
+            if palavra in texto_lower:
+                return categoria
+    return "Outros"
+
+
+def extrair_descricao(texto, nome_ficheiro):
+    """Tenta extrair uma descrição curta da fatura."""
+    # Procurar linhas com "fatura", "referência", "descrição"
+    for linha in texto.split("\n"):
+        linha = linha.strip()
+        if any(k in linha.lower() for k in ["fatura nº","fatura n.","ref.","referência","documento"]):
+            if len(linha) > 5:
+                return linha[:80]
+    # Fallback: usar o nome do ficheiro sem extensão
+    return nome_ficheiro.replace(".pdf", "").replace("_", " ")
+
+
+def analisar_pdf_local(pdf_bytes, nome_ficheiro):
+    """
+    Extrai dados financeiros de um PDF localmente com pdfplumber.
+    Devolve lista de registos no mesmo formato da versão IA.
+    """
+    texto = extrair_texto_pdf(pdf_bytes)
+
+    if not texto.strip():
+        raise ValueError("PDF sem texto extraível (pode ser uma imagem digitalizada).")
+
+    data      = parsear_data(texto)
+    valor     = parsear_valor(texto)
+    categoria = inferir_categoria(texto)
+    descricao = extrair_descricao(texto, nome_ficheiro)
+
+    # Tentar extrair múltiplas linhas de extrato bancário
+    # Padrão típico BPI/CGD: "DD/MM/YYYY Descrição -123,45"
+    registos = []
+    padrao_extrato = re.compile(
+        r"(\d{2}[/-]\d{2}[/-]\d{4})\s+(.+?)\s+([-+]?\d{1,6}[.,]\d{2})\s*€?$",
+        re.MULTILINE
+    )
+    for m in padrao_extrato.finditer(texto):
+        try:
+            d_str = m.group(1).replace("-", "/")
+            d_obj = datetime.strptime(d_str, "%d/%m/%Y").strftime("%Y-%m-%d")
+            desc  = m.group(2).strip()[:80]
+            val   = float(m.group(3).replace(".", "").replace(",", "."))
+            if val == 0:
+                continue
+            registos.append({
+                "data":      d_obj,
+                "descricao": desc,
+                "categoria": inferir_categoria(desc),
+                "valor":     abs(val),
+                "_tipo":     "receita" if val > 0 else "despesa",
+            })
+        except ValueError:
+            continue
+
+    # Se não encontrou linhas de extrato, devolve registo único
+    if not registos:
+        registos = [{
+            "data":      data,
+            "descricao": descricao,
+            "categoria": categoria,
+            "valor":     valor,
+            "_tipo":     "despesa",
         }]
-    }
-    headers = {
-        "x-api-key": api_key,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-    }
-    resp = requests.post("https://api.anthropic.com/v1/messages",
-                         json=payload, headers=headers, timeout=60)
-    resp.raise_for_status()
-    texto = "".join(b.get("text","") for b in resp.json().get("content",[]) if b.get("type")=="text")
-    texto_limpo = re.sub(r"```(?:json)?|```", "", texto).strip()
-    return json.loads(texto_limpo)
+
+    return registos
 
 # ══════════════════════════════════════════════════════════════
 # SIDEBAR — NAVEGAÇÃO
